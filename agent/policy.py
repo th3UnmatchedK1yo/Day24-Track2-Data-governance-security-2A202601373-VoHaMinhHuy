@@ -37,4 +37,33 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Policy Enforcement Point — đánh giá request dựa trên context.
+
+    Trả về (allow: bool, reason: str). reason KHÔNG BAO GIỜ rỗng.
+    """
+    # Rule 1 (BẮT BUỘC): restricted data + egress enabled → DENY
+    # Đây là rule tối thiểu theo đề bài — ngăn PII bị gửi ra ngoài.
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return (
+            False,
+            f"DENY: restricted data with egress enabled is forbidden "
+            f"(owner={context.agent_owner}, purpose={context.request_purpose})",
+        )
+
+    # Rule 2: restricted data ở delegation depth > 1 → cảnh giác
+    # (agent gọi agent gọi agent — quá sâu, có thể bị lợi dụng)
+    if context.data_classification == "restricted" and context.delegation_depth > 1:
+        return (
+            False,
+            f"DENY: restricted data at delegation depth {context.delegation_depth} "
+            f"exceeds maximum (owner={context.agent_owner})",
+        )
+
+    # Default: ALLOW (với reason mô tả đầy đủ)
+    return (
+        True,
+        f"ALLOW: classification={context.data_classification}, "
+        f"egress={'enabled' if context.egress_enabled else 'disabled'}, "
+        f"depth={context.delegation_depth}, "
+        f"purpose={context.request_purpose}, owner={context.agent_owner}",
+    )
