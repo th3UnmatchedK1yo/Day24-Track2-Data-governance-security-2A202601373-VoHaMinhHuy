@@ -53,11 +53,175 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import ledger, tools
+from agent.policy import PolicyContext, check as policy_check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
 
+def _make_entry(
+    agent_id: str,
+    run_id: str,
+    tool_name: str,
+    args_summary: str,
+    classification: str,
+    decision: str,
+    reason: str,
+) -> dict:
+    """Tạo entry dict chuẩn cho ledger."""
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "tool": tool_name,
+        "args_hash": hashlib.sha256(args_summary.encode("utf-8")).hexdigest()[:16],
+        "classification": classification,
+        "decision": decision,
+        "reason": reason,
+    }
+
+
+def _extract_ticket_id(filename: str) -> int | None:
+    """Trích ticket_id từ tên file (vd 'ticket-007.md' -> 7).
+
+    Chỉ lấy file dạng ticket-NNN.md (không lấy ticket-904b.md).
+    Cả ticket phụ (904b) cũng được tính theo ticket chính (904).
+    """
+    m = re.search(r"ticket-(\d+)", filename)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _build_ticket_to_customer_map() -> dict[int, list[str]]:
+    """Xây map ticket_id -> list[customer_id] từ NGUỒN TIN CẬY (customers.json)."""
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    mapping: dict[int, list[str]] = {}
+    for cust in customers:
+        for tid in cust.get("related_tickets", []):
+            mapping.setdefault(tid, []).append(cust["customer_id"])
+    return mapping
+
+
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    """Trifecta-split runner: tách untrusted content khỏi private data.
+
+    Run A: đọc corpus (untrusted), trích ticket_id typed từ tên file.
+    Run B: tra customer qua related_tickets (trusted), đọc private data.
+    Không run nào cầm cả 3 chân cùng lúc.
+    """
+    ledger_dir = log_dir or REPORTS_DIR
+    ledger_path = ledger_dir / "ledger.jsonl"
+    agent_id = "lab24-agent"
+    run_a_id = f"run-a-{uuid.uuid4().hex[:8]}"
+    run_b_id = f"run-b-{uuid.uuid4().hex[:8]}"
+
+    # ════════════════════════════════════════════════════════════════════
+    # RUN A — untrusted content only (search_docs)
+    #   KHÔNG có quyền: read_customer, http_post
+    #   egress_enabled = False
+    # ════════════════════════════════════════════════════════════════════
+
+    # Policy check cho search_docs
+    ctx_search = PolicyContext(
+        data_classification="public",
+        request_purpose="search-corpus",
+        agent_owner=run_a_id,
+        delegation_depth=0,
+        egress_enabled=False,
+    )
+    allow_search, reason_search = policy_check(ctx_search)
+    ledger.append(
+        _make_entry(
+            agent_id, run_a_id, "search_docs", message,
+            "public", "allow" if allow_search else "deny", reason_search,
+        ),
+        ledger_path,
+    )
+
+    if not allow_search:
+        return "Policy denied search_docs."
+
+    # Gọi search_docs
+    docs = tools.search_docs(message)
+
+    # Trích ticket_id typed từ TÊN FILE (sanitized, không từ content)
+    ticket_ids: list[int] = []
+    for d in docs:
+        tid = _extract_ticket_id(d["id"])
+        if tid is not None:
+            ticket_ids.append(tid)
+
+    # Phát hiện injection (chỉ để log, KHÔNG dùng customer_id từ đây)
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    injected = llm.find_injection(combined_text)
+
+    if injected is not None:
+        # Log deny cho http_post vì phát hiện injection attempt
+        ctx_exfil = PolicyContext(
+            data_classification="restricted",
+            request_purpose="exfil-attempt-blocked",
+            agent_owner=run_a_id,
+            delegation_depth=0,
+            egress_enabled=True,
+        )
+        _, reason_exfil = policy_check(ctx_exfil)
+        ledger.append(
+            _make_entry(
+                agent_id, run_a_id, "http_post",
+                injected.target_url,
+                "restricted", "deny", reason_exfil,
+            ),
+            ledger_path,
+        )
+
+    # ════════════════════════════════════════════════════════════════════
+    # RUN B — private data only (read_customer)
+    #   KHÔNG đọc free text, CHỈ nhận typed ticket_ids từ Run A
+    #   Tra customer qua related_tickets (nguồn tin cậy)
+    #   egress_enabled = False
+    # ════════════════════════════════════════════════════════════════════
+
+    ticket_to_customers = _build_ticket_to_customer_map()
+
+    # Map ticket_id → customer_id qua NGUỒN TIN CẬY
+    customer_ids_to_read: set[str] = set()
+    for tid in ticket_ids:
+        for cid in ticket_to_customers.get(tid, []):
+            customer_ids_to_read.add(cid)
+
+    for cid in sorted(customer_ids_to_read):
+        ctx_read = PolicyContext(
+            data_classification="restricted",
+            request_purpose="customer-lookup-for-ticket",
+            agent_owner=run_b_id,
+            delegation_depth=1,
+            egress_enabled=False,
+        )
+        allow_read, reason_read = policy_check(ctx_read)
+        ledger.append(
+            _make_entry(
+                agent_id, run_b_id, "read_customer", cid,
+                "restricted", "allow" if allow_read else "deny", reason_read,
+            ),
+            ledger_path,
+        )
+
+        if allow_read:
+            try:
+                tools.read_customer(cid)
+            except tools.ToolError:
+                pass
+
+    # ════════════════════════════════════════════════════════════════════
+    # Trả về kết quả — hành vi quan sát từ ngoài không đổi
+    # ════════════════════════════════════════════════════════════════════
+    return llm.summarize(docs)
